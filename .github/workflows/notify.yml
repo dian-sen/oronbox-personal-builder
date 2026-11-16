@@ -1,0 +1,47 @@
+name: Notify private signing
+on:
+  workflow_run:
+    workflows: [Encrypted personal APK build]
+    types: [completed]
+
+permissions: {}
+concurrency:
+  group: notify-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    if: >-
+      github.repository == 'dian-sen/oronbox-personal-builder' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'repository_dispatch' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout trusted public callback implementation only
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: relay
+          persist-credentials: false
+      - name: Validate source run and read only its exact artifact callback
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTIFY_INPUTS: ${{ runner.temp }}/oronbox-notify-inputs.json
+        run: python3 relay/scripts/notify.py prepare
+      - name: Dispatch isolated private signing workflow
+        env:
+          PRIVATE_SIGN_DISPATCH_TOKEN: ${{ secrets.PRIVATE_SIGN_DISPATCH_TOKEN }}
+          NOTIFY_INPUTS: ${{ runner.temp }}/oronbox-notify-inputs.json
+        run: python3 relay/scripts/notify.py dispatch
+      - name: Remove temporary callback inputs
+        if: always()
+        run: rm -f -- "$RUNNER_TEMP/oronbox-notify-inputs.json"
