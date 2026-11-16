@@ -111,6 +111,8 @@ class RelayTest(unittest.TestCase):
             'path': '.github/workflows/build.yml', 'display_title': 'Relay ' + self.payload['request_id'],
         }
         self.assertEqual(notify.validate_run(run, '456'), self.payload['request_id'])
+        dynamic = dict(run, name=run['display_title'])
+        self.assertEqual(notify.validate_run(dynamic, '456'), self.payload['request_id'])
         for change in ({'display_title': 'Relay wrong'}, {'head_branch': 'other'}, {'event': 'push'}):
             with self.assertRaises(ValueError):
                 notify.validate_run(dict(run, **change), '456')
@@ -157,6 +159,38 @@ class RelayTest(unittest.TestCase):
                     pubspec.write_text('version: 1.2.0+17\n')
                     with self.assertRaises(ValueError):
                         relay.verify_source(source)
+
+    def test_notification_prepare_recovers_existing_successful_run(self):
+        callback = {k: self.payload[k] for k in notify.CALLBACK_KEYS}
+        raw = io.BytesIO()
+        with zipfile.ZipFile(raw, 'w') as archive:
+            archive.writestr('payload.cms', b'encrypted-signing-input')
+            archive.writestr('callback.json', json.dumps(callback))
+        run = {'id': 456, 'workflow_id': 12, 'status': 'completed', 'conclusion': 'success',
+               'event': 'repository_dispatch', 'head_branch': 'main', 'run_attempt': 1,
+               'head_repository': {'full_name': notify.REPOSITORY},
+               'repository': {'full_name': notify.REPOSITORY},
+               'name': 'Relay ' + self.payload['request_id'],
+               'path': '.github/workflows/build.yml', 'display_title': 'Relay ' + self.payload['request_id']}
+        workflow = {'id': 12, 'path': '.github/workflows/build.yml'}
+        listing = {'total_count': 1, 'artifacts': [{'id': 77, 'name': 'relay-' + self.payload['request_id'],
+                   'expired': False, 'workflow_run': {'id': 456}, 'size_in_bytes': len(raw.getvalue())}]}
+        event = self.root / 'recovery-event.json'
+        inputs = self.root / 'recovery-inputs.json'
+        event.write_text(json.dumps({'inputs': {'relay_run_id': '456'}}))
+        def api_json(path, token):
+            if path.endswith('/actions/runs/456'): return dict(run)
+            if path.endswith('/actions/workflows/build.yml'): return dict(workflow)
+            return listing
+        with patch.dict(os.environ, GITHUB_EVENT_NAME='workflow_dispatch', GITHUB_REF='refs/heads/main',
+                        GITHUB_REPOSITORY=notify.REPOSITORY, GITHUB_EVENT_PATH=str(event),
+                        GH_TOKEN='offline-placeholder', NOTIFY_INPUTS=str(inputs)):
+            with patch.object(notify, 'api_json', side_effect=api_json), patch.object(notify, 'api') as api:
+                api.return_value.__enter__.return_value.read.return_value = raw.getvalue()
+                notify.prepare()
+                self.assertEqual(json.loads(inputs.read_text()), dict(callback, relay_run_id='456'))
+                workflow['id'] = 99
+                with self.assertRaises(ValueError): notify.prepare()
 
     def test_pat_dispatch_exact_four_inputs(self):
         inputs = {k: self.payload[k] for k in notify.CALLBACK_KEYS}

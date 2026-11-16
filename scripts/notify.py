@@ -83,7 +83,8 @@ def validate_run(run, run_id, request_id=None):
     require(run.get('event') == 'repository_dispatch' and run.get('head_branch') == 'main', 'Wrong run origin')
     require(run.get('head_repository', {}).get('full_name') == REPOSITORY, 'Wrong source repository')
     require(run.get('repository', {}).get('full_name') == REPOSITORY, 'Wrong run repository')
-    require(run.get('name') == 'Encrypted personal APK build', 'Wrong workflow name')
+    # GitHub can return the dynamic run-name in `name`; workflow identity is
+    # the fixed path plus its authoritative numeric workflow ID, checked below.
     require(run.get('path') == '.github/workflows/build.yml', 'Wrong workflow path')
     title = re.fullmatch(r'Relay ([0-9a-f]{32})', run.get('display_title', ''))
     require(title is not None, 'Invalid run title')
@@ -109,18 +110,31 @@ def callback_from_archive(raw):
 
 def prepare():
     event = decode_json(Path(os.environ['GITHUB_EVENT_PATH']).read_bytes())
-    require(os.environ.get('GITHUB_EVENT_NAME') == 'workflow_run', 'Wrong event type')
-    require(event.get('action') == 'completed', 'Wrong workflow action')
+    event_name = os.environ.get('GITHUB_EVENT_NAME')
     require(os.environ.get('GITHUB_REPOSITORY') == REPOSITORY, 'Wrong repository')
-    run = event['workflow_run']
-    run_id = str(run['id'])
-    require(re.fullmatch(r'[1-9][0-9]{0,19}', run_id) is not None, 'Invalid run ID')
-    request_id = validate_run(run, run_id)
     token = os.environ['GH_TOKEN']
+    if event_name == 'workflow_run':
+        require(event.get('action') == 'completed', 'Wrong workflow action')
+        run = event['workflow_run']
+        run_id = str(run['id'])
+        require(re.fullmatch(r'[1-9][0-9]{0,19}', run_id) is not None, 'Invalid run ID')
+        request_id = validate_run(run, run_id)
+    else:
+        require(event_name == 'workflow_dispatch' and os.environ.get('GITHUB_REF') == 'refs/heads/main',
+                'Recovery requires manual dispatch on main')
+        run_id = event.get('inputs', {}).get('relay_run_id', '')
+        require(isinstance(run_id, str) and re.fullmatch(r'[1-9][0-9]{0,19}', run_id) is not None,
+                'Invalid recovery run ID')
+        request_id, run = None, None
     # Re-fetch authoritative run metadata, using only this notify run's GITHUB_TOKEN.
     authoritative = api_json(f'/repos/{REPOSITORY}/actions/runs/{run_id}', token)
-    validate_run(authoritative, run_id, request_id)
-    require(authoritative.get('run_attempt') == run.get('run_attempt'), 'Run attempt changed')
+    request_id = validate_run(authoritative, run_id, request_id)
+    workflow = api_json(f'/repos/{REPOSITORY}/actions/workflows/build.yml', token)
+    require(workflow.get('path') == '.github/workflows/build.yml'
+            and isinstance(workflow.get('id'), int)
+            and authoritative.get('workflow_id') == workflow['id'], 'Wrong build workflow identity')
+    if run is not None:
+        require(authoritative.get('run_attempt') == run.get('run_attempt'), 'Run attempt changed')
     result = api_json(f'/repos/{REPOSITORY}/actions/runs/{run_id}/artifacts?per_page=100', token)
     artifacts = result.get('artifacts', [])
     require(result.get('total_count') == 1 and len(artifacts) == 1, 'Expected one run artifact')
@@ -164,9 +178,13 @@ def main():
     args = parser.parse_args()
     try:
         prepare() if args.operation == 'prepare' else dispatch()
-    except (ValueError, KeyError, OSError, zipfile.BadZipFile, urllib.error.HTTPError,
-            urllib.error.URLError, json.JSONDecodeError):
-        raise SystemExit('Isolated callback failed validation or GitHub API request.')
+    except ValueError as error:
+        # Validation messages are fixed strings, never raw payloads or tokens.
+        raise SystemExit(f'Isolated callback rejected: {error}') from None
+    except urllib.error.HTTPError as error:
+        raise SystemExit(f'Isolated callback API request failed: HTTP {error.code}') from None
+    except (KeyError, OSError, zipfile.BadZipFile, urllib.error.URLError):
+        raise SystemExit('Isolated callback failed parsing or network access.') from None
 
 
 if __name__ == '__main__':
